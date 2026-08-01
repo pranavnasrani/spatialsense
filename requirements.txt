@@ -1,0 +1,5 @@
+ultralytics
+huggingface-hub
+torch
+transformers
+opencv-python
