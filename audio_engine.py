@@ -1,23 +1,22 @@
 """
-audio_engine.py — Real-time binaural audio engine for SpatialSense.
+audio_engine.py — Real-time binaural audio engine for SpatialSense (v2).
 
 Converts YOLO detections + depth grid into spatially positioned sound sources
 rendered on headphones using ILD (Interaural Level Difference) and ITD
 (Interaural Time Delay) binaural spatialization.
 
-Design principles
-─────────────────
-  • Warm triangle-wave tones via vectorised additive synthesis
+v2 improvements over v1
+───────────────────────
+  • Warm triangle-wave tones via additive synthesis (not harsh pure sines)
   • Hann-windowed pulse bursts — zero-click, smooth attack/release
-  • Spatial nearest-neighbour source tracking (handles multiple same-class objects)
+  • Proximity correctly maps higher depth → closer (was inverted in v1)
+  • Depth range derived from grid + objects (single-object case handled)
   • EMA smoothing on all source parameters — no jumps between frames
   • Fade-in / fade-out lifecycle for appearing/disappearing sources
   • Pentatonic frequency mapping — simultaneous tones always consonant
   • Distance-dependent brightness via harmonic count (close=bright, far=muffled)
-  • Proximity field: musical orientation tone from closest depth-grid cell
-  • Per-source gain normalised by 1/√N to prevent clipping at high counts
-  • tanh soft-clipping for smooth, pump-free limiting
-  • Silence = safe: no sound when no obstacles are near
+  • Proximity field replaces bare 80 Hz drone with a musical orientation tone
+  • Per-source gain normalised by 1/sqrt(N) to prevent clipping at high counts
 
 Threading model
 ───────────────
@@ -46,16 +45,12 @@ from audio_types import AudioFrame, DetectedObject
 SAMPLE_RATE = 44100
 BLOCK_SIZE  = 512           # ~11.6 ms per audio callback block
 
-MASTER_GAIN = 0.60          # Overall output level — tune to taste
 MAX_SOURCES = 4             # Perceptual cap on simultaneous positioned tones
 
 # Threat score weights (sum to 1.0)
 W_PROX = 0.55
 W_CENT = 0.30
 W_AREA = 0.15
-
-# Minimum threat to produce any sound at all (silence = safe)
-THREAT_FLOOR = 0.10
 
 # Pulse cadence: threat ∈ [0, 1] → interval ∈ [SLOW, FAST] seconds
 PULSE_SLOW_SEC = 1.80       # Low threat — gentle, infrequent
@@ -68,7 +63,8 @@ BURST_DUR_SEC = 0.10
 # ── Pentatonic frequency palette ─────────────────────────────────────────────
 #
 # All tones drawn from a C-major pentatonic scale (C D E G A) across octaves.
-# Any combination sounds consonant — no dissonance when ≤4 sources overlap.
+# Any combination of these sounds consonant — no dissonance when 4 sources
+# play simultaneously.
 
 CLASS_FREQ: dict[str, float] = {
     # People — warm mid-range
@@ -96,9 +92,8 @@ CLASS_FREQ: dict[str, float] = {
 }
 
 # Proximity field tone (ambient orientation indicator)
-FIELD_FREQ       = 220.0    # A3 — warm, unobtrusive
-FIELD_MAX_GAIN   = 0.10     # Very subtle so it never masks object tones
-FIELD_PROX_FLOOR = 0.20     # Below this proximity the field is silent (silence = safe)
+FIELD_FREQ     = 220.0      # A3 — warm, unobtrusive
+FIELD_MAX_GAIN = 0.10       # Very subtle so it never masks object tones
 
 # 3×3 grid → spatial angles for the proximity field
 _GRID_AZ = [[-60, 0, 60], [-60, 0, 60], [-60, 0, 60]]
@@ -111,10 +106,6 @@ SMOOTH_ALPHA = 0.25
 # Fade-in / fade-out duration in seconds
 FADE_SEC = 0.08             # 80 ms crossfade
 
-# Source-matching: maximum angular distance (degrees) to consider a new
-# detection the "same" as an existing source.  Prevents cross-room teleports.
-MATCH_DIST_MAX = 90.0
-
 # ── Source state ──────────────────────────────────────────────────────────────
 
 class _Source:
@@ -125,7 +116,7 @@ class _Source:
     The `life` field controls fade-in (0→1) and fade-out (1→0).
     """
     __slots__ = (
-        "label", "freq", "uid",
+        "label", "freq",
         # Current (smoothed) spatial parameters
         "azimuth", "elevation", "proximity", "threat",
         # Targets (set each frame, smoothed toward)
@@ -137,11 +128,10 @@ class _Source:
         "dying",        # True = fading out, removed when life ≤ 0
     )
 
-    def __init__(self, label: str, freq: float, uid: int,
+    def __init__(self, label: str, freq: float,
                  az: float, el: float, prox: float, threat: float):
         self.label       = label
         self.freq        = freq
-        self.uid         = uid
         self.azimuth     = az
         self.elevation   = el
         self.proximity   = prox
@@ -170,10 +160,6 @@ class _Source:
         self.elevation += a * (self._tgt_el     - self.elevation)
         self.proximity += a * (self._tgt_prox   - self.proximity)
         self.threat    += a * (self._tgt_threat  - self.threat)
-
-    def spatial_dist(self, az: float, el: float) -> float:
-        """Angular distance to a candidate position (for nearest-neighbour matching)."""
-        return abs(self.azimuth - az) + abs(self.elevation - el)
 
 
 # ── DSP helpers ───────────────────────────────────────────────────────────────
@@ -218,38 +204,29 @@ def _triangle_tone(
     n_harmonics: int,
 ) -> np.ndarray:
     """
-    Bandlimited triangle wave via vectorised additive synthesis.
+    Bandlimited triangle wave via additive synthesis.
 
     Triangle waves contain only odd harmonics with amplitude ∝ 1/n².
     They sound warm and rounded — much more pleasant than a pure sine
     while remaining clearly pitched.
 
     `n_harmonics` controls brightness:
-      - 2–3: muffled (simulates distance / air absorption)
+      - 2–3: muffled (simulates distance/air absorption)
       - 6–8: bright and clear (close object)
-
-    Fully vectorised: one 2-D broadcast instead of a Python for-loop.
     """
-    t = np.arange(frames, dtype=np.float64) / SAMPLE_RATE  # (frames,)
+    t = np.arange(frames, dtype=np.float64) / SAMPLE_RATE
+    signal = np.zeros(frames, dtype=np.float64)
 
-    # Build harmonic indices: 1, 3, 5, 7, …
-    ks = np.arange(n_harmonics)
-    ns = 2 * ks + 1                                        # (H,)
-    harmonic_freqs = ns * freq
+    for k in range(n_harmonics):
+        n    = 2 * k + 1                    # odd harmonics: 1, 3, 5, 7 …
+        sign = 1.0 if (k % 2 == 0) else -1.0
+        harmonic_freq = n * freq
 
-    # Anti-aliasing: drop harmonics above Nyquist
-    valid = harmonic_freqs < SAMPLE_RATE * 0.45
-    if not np.any(valid):
-        return np.zeros(frames, dtype=np.float32)
+        # Stop before Nyquist to avoid aliasing
+        if harmonic_freq >= SAMPLE_RATE * 0.45:
+            break
 
-    ns    = ns[valid].astype(np.float64)                   # (H',)
-    signs = np.where((np.arange(len(ns)) % 2) == 0, 1.0, -1.0)  # alternating ±
-    amps  = signs / (ns * ns)                              # (H',)
-    freqs = ns * freq                                      # (H',)
-
-    # 2-D broadcast: (H', 1) × (1, frames) → (H', frames), then sum over H'
-    phases = 2.0 * np.pi * freqs[:, None] * t[None, :] + (ns * phase)[:, None]
-    signal = np.sum(amps[:, None] * np.sin(phases), axis=0)
+        signal += sign * np.sin(2.0 * np.pi * harmonic_freq * t + n * phase) / (n * n)
 
     # Normalise: theoretical peak of a triangle wave from this series is π²/8
     signal *= 8.0 / (np.pi * np.pi)
@@ -320,7 +297,6 @@ class AudioEngine:
 
     def __init__(self) -> None:
         self._sources: list[_Source] = []
-        self._next_uid = 0          # Monotonic ID for unique source tracking
 
         # Proximity field state (ambient orientation indicator from depth grid)
         self._field_az    = 0.0
@@ -439,71 +415,45 @@ class AudioEngine:
 
             scored.append((threat, az, el, prox, obj.label))
 
-        # Keep top-N by threat, drop below minimum threat floor
+        # Keep top-N by threat
         scored.sort(key=lambda x: x[0], reverse=True)
-        top = [s for s in scored[:MAX_SOURCES] if s[0] >= THREAT_FLOOR]
+        top = scored[:MAX_SOURCES]
 
         # ── Proximity field from grid ────────────────────────────────────────
         g_max = float(grid.max())
         if g_max > 0:
-            flat_idx   = int(np.argmax(grid))
-            ri, ci     = divmod(flat_idx, 3)
+            flat_idx = int(np.argmax(grid))
+            ri, ci   = divmod(flat_idx, 3)
             field_prox = float(grid[ri, ci] - d_min) / d_rng
-            f_az       = float(_GRID_AZ[ri][ci])
-            f_el       = float(_GRID_EL[ri][ci])
-            # Only produce sound if closest cell is above the proximity floor
-            if field_prox >= FIELD_PROX_FLOOR:
-                f_gain = FIELD_MAX_GAIN * float(np.clip(field_prox, 0.0, 1.0))
-            else:
-                f_gain = 0.0
+            f_az   = float(_GRID_AZ[ri][ci])
+            f_el   = float(_GRID_EL[ri][ci])
+            f_gain = FIELD_MAX_GAIN * float(np.clip(field_prox, 0.0, 1.0))
         else:
             f_az = f_el = f_gain = 0.0
 
-        # ── Update source pool via spatial nearest-neighbour matching ─────────
-        #
-        # Label-only matching fails when multiple objects share a class (e.g.
-        # two "person" detections).  Instead, for each new detection, find the
-        # closest existing source with the SAME label and within MATCH_DIST_MAX
-        # degrees.  Unmatched detections create new sources; unmatched existing
-        # sources start their fade-out.
+        # ── Update source pool (under lock) ──────────────────────────────────
         with self._lock:
-            available = [s for s in self._sources if not s.dying]
-            matched_uids: set[int] = set()
-            new_sources: list[_Source] = []
+            existing = {s.label: s for s in self._sources if not s.dying}
 
+            active_labels: set[str] = set()
             for threat, az, el, prox, label in top:
+                active_labels.add(label)
                 freq = CLASS_FREQ.get(label, CLASS_FREQ["_default"])
 
-                # Find closest existing source with the same label
-                best_src  = None
-                best_dist = MATCH_DIST_MAX
-
-                for src in available:
-                    if src.uid in matched_uids:
-                        continue                 # already claimed
-                    if src.label != label:
-                        continue                 # wrong class
-                    d = src.spatial_dist(az, el)
-                    if d < best_dist:
-                        best_dist = d
-                        best_src  = src
-
-                if best_src is not None:
-                    matched_uids.add(best_src.uid)
-                    best_src.set_target(az, el, prox, threat)
-                    best_src.smooth_step()
+                if label in existing:
+                    src = existing[label]
+                    src.set_target(az, el, prox, threat)
+                    src.smooth_step()
                 else:
-                    # New source — assign a unique ID and start at life=0 (fades in)
-                    src = _Source(label, freq, self._next_uid, az, el, prox, threat)
-                    self._next_uid += 1
+                    src = _Source(label, freq, az, el, prox, threat)
                     self._sources.append(src)
 
-            # Mark unmatched sources for fade-out
+            # Mark sources no longer in top-N for fade-out
             for src in self._sources:
-                if src.uid not in matched_uids and not src.dying:
+                if src.label not in active_labels and not src.dying:
                     src.dying = True
 
-            # Garbage-collect fully faded sources
+            # Remove fully faded-out sources
             self._sources = [s for s in self._sources if s.life > 0.0 or not s.dying]
 
             # Smooth the proximity field targets
@@ -573,7 +523,7 @@ class AudioEngine:
                 ) % (2.0 * math.pi)
 
             # ── Per-source gain normalisation ─────────────────────────────────
-            # 1/√N prevents N sources from being N× louder than 1 source
+            # 1/sqrt(N) prevents N sources from being N× louder than 1 source
             source_norm = 1.0 / math.sqrt(max(n_active, 1))
 
             # ── Synthesise object sources (outside lock) ──────────────────────
@@ -596,16 +546,15 @@ class AudioEngine:
                 mixed += _spatialize(mono, az, el, prox) * gain
 
             # ── Proximity field (outside lock) ────────────────────────────────
-            if f_gain > 0.01:
+            if f_gain > 0.005:
                 field_tone = _triangle_tone(frames, FIELD_FREQ, f_phase, 3)
+                # Gentle continuous tone (no pulsing) — always-on orientation cue
                 mixed += _spatialize(field_tone, f_az, f_el, 0.4) * f_gain
 
-            # ── Master gain + tanh soft-clipping ──────────────────────────────
-            # tanh gives smooth, pump-free limiting without the volume jumps of
-            # a per-block peak normaliser.  Pre-gain of 1.5 drives into the
-            # saturation knee only when multiple loud sources overlap.
-            mixed *= MASTER_GAIN
-            mixed = np.tanh(mixed * 1.5).astype(np.float32)
+            # ── Soft limiter ──────────────────────────────────────────────────
+            peak = float(np.max(np.abs(mixed)))
+            if peak > 0.80:
+                mixed *= 0.80 / peak
 
             outdata[:] = mixed
 
