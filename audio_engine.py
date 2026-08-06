@@ -92,8 +92,8 @@ CLASS_FREQ: dict[str, float] = {
 }
 
 # Proximity field tone (ambient orientation indicator)
-FIELD_FREQ     = 220.0      # A3 — warm, unobtrusive
-FIELD_MAX_GAIN = 0.10       # Very subtle so it never masks object tones
+FIELD_FREQ     = 220.0      # A3 — warm, unobtrusive tone for depth navigation
+FIELD_MAX_GAIN = 0.40       # Clear, audible spatial tone for nearest obstacle sector
 
 # 3×3 grid → spatial angles for the proximity field
 _GRID_AZ = [[-60, 0, 60], [-60, 0, 60], [-60, 0, 60]]
@@ -295,8 +295,9 @@ class AudioEngine:
     Non-blocking binaural audio engine with smooth lifecycle management.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, volume: float = 1.0) -> None:
         self._sources: list[_Source] = []
+        self._volume = max(0.0, volume)
 
         # Proximity field state (ambient orientation indicator from depth grid)
         self._field_az    = 0.0
@@ -322,7 +323,7 @@ class AudioEngine:
             dtype="float32",
             blocksize=BLOCK_SIZE,
             callback=self._audio_callback,
-            latency="low",
+            latency="high",  # 'high' buffer prevents CoreAudio underflow abort on macOS under Metal/ANE GPU load
         )
         self._proc_thread = threading.Thread(
             target=self._processor_loop,
@@ -380,9 +381,13 @@ class AudioEngine:
 
         # ── Establish the scene depth range from BOTH objects AND grid ────────
         # This prevents the single-object edge case from collapsing the range.
-        all_depths: list[float] = [o.depth for o in objects]
+        all_depths: list[float] = []
+        for o in objects:
+            if not math.isnan(o.depth):
+                all_depths.append(o.depth)
+                
         for v in grid.flat:
-            if v > 0:
+            if v > 0 and not math.isnan(v):
                 all_depths.append(float(v))
 
         if all_depths:
@@ -397,7 +402,10 @@ class AudioEngine:
 
         for obj in objects:
             # Proximity: higher depth value = closer (after main.py inversion)
-            prox = (obj.depth - d_min) / d_rng
+            if math.isnan(obj.depth):
+                prox = 0.0
+            else:
+                prox = (obj.depth - d_min) / d_rng
 
             # Centrality: 1.0 if bbox centre == frame centre
             dx   = abs(obj.cx - 0.5)
@@ -408,6 +416,8 @@ class AudioEngine:
             area = float(np.clip(obj.bbox_area_frac, 0.0, 1.0))
 
             threat = W_PROX * prox + W_CENT * cent + W_AREA * area
+            if math.isnan(threat):
+                threat = 0.0
 
             # Spatial angle from bbox centre
             az = (obj.cx - 0.5) * 180.0      # –90 (left) … +90 (right)
@@ -420,16 +430,40 @@ class AudioEngine:
         top = scored[:MAX_SOURCES]
 
         # ── Proximity field from grid ────────────────────────────────────────
-        g_max = float(grid.max())
+        # Safely compute g_max ignoring NaNs
+        valid_grid = grid[~np.isnan(grid)]
+        g_max = float(valid_grid.max()) if valid_grid.size > 0 else 0.0
+        
         if g_max > 0:
-            flat_idx = int(np.argmax(grid))
+            flat_idx = int(np.nanargmax(grid))
             ri, ci   = divmod(flat_idx, 3)
-            field_prox = float(grid[ri, ci] - d_min) / d_rng
+            
+            # Avoid division by near-zero range when depth is uniform across sectors
+            if d_rng > 1e-3:
+                field_prox = float(grid[ri, ci] - d_min) / d_rng
+            else:
+                field_prox = 0.5  # Neutral fallback when all sectors have equal depth
+                
+            field_prox = float(np.clip(field_prox, 0.0, 1.0))
+            if math.isnan(field_prox):
+                field_prox = 0.5
+            
             f_az   = float(_GRID_AZ[ri][ci])
             f_el   = float(_GRID_EL[ri][ci])
-            f_gain = FIELD_MAX_GAIN * float(np.clip(field_prox, 0.0, 1.0))
+            
+            # Dynamic frequency mapping: closer = higher pitch, height (top vs bottom) shifts pitch
+            # Base range: 220Hz (A3 - far) -> 352Hz (F4 - close)
+            # Height offset: Top row = +12%, Mid = 0%, Bottom = -12%
+            height_mult = 1.12 if ri == 0 else (0.88 if ri == 2 else 1.0)
+            f_freq = (220.0 + 132.0 * field_prox) * height_mult
+
+            # Smooth gain curve: gentle floor (0.25) so it never silent-drops, swells for close obstacles
+            f_gain = FIELD_MAX_GAIN * (0.25 + 0.75 * field_prox)
         else:
-            f_az = f_el = f_gain = 0.0
+            f_az = 0.0
+            f_el = 0.0
+            f_freq = FIELD_FREQ
+            f_gain = FIELD_MAX_GAIN * 0.25
 
         # ── Update source pool (under lock) ──────────────────────────────────
         with self._lock:
@@ -465,6 +499,8 @@ class AudioEngine:
             self._field_az   += a * (self._field_tgt_az   - self._field_az)
             self._field_el   += a * (self._field_tgt_el   - self._field_el)
             self._field_gain += a * (self._field_tgt_gain - self._field_gain)
+            # Smooth frequency transitions
+            self._field_freq = getattr(self, "_field_freq", FIELD_FREQ) + a * (f_freq - getattr(self, "_field_freq", FIELD_FREQ))
 
     # ── sounddevice callback ──────────────────────────────────────────────────
 
@@ -516,10 +552,11 @@ class AudioEngine:
                 f_az    = self._field_az
                 f_el    = self._field_el
                 f_gain  = self._field_gain
+                f_freq  = getattr(self, "_field_freq", FIELD_FREQ)
                 f_phase = self._field_phase
                 self._field_phase = (
                     self._field_phase
-                    + 2.0 * math.pi * FIELD_FREQ * frames / SAMPLE_RATE
+                    + 2.0 * math.pi * f_freq * frames / SAMPLE_RATE
                 ) % (2.0 * math.pi)
 
             # ── Per-source gain normalisation ─────────────────────────────────
@@ -546,17 +583,22 @@ class AudioEngine:
                 mixed += _spatialize(mono, az, el, prox) * gain
 
             # ── Proximity field (outside lock) ────────────────────────────────
-            if f_gain > 0.005:
-                field_tone = _triangle_tone(frames, FIELD_FREQ, f_phase, 3)
-                # Gentle continuous tone (no pulsing) — always-on orientation cue
+            if f_gain > 0.001:
+                # Warm marimba/pad synthesis (fundamental + warm harmonics)
+                field_tone = _triangle_tone(frames, f_freq, f_phase, 3)
                 mixed += _spatialize(field_tone, f_az, f_el, 0.4) * f_gain
 
-            # ── Soft limiter ──────────────────────────────────────────────────
+            # ── Apply Volume Multiplier ────────────────────────────────────────
+            mixed *= self._volume
+
+            # ── Soft Limiter (Smooth Tanh Saturation - zero digital clipping) ─
             peak = float(np.max(np.abs(mixed)))
-            if peak > 0.80:
-                mixed *= 0.80 / peak
+            limit = 0.85 * max(1.0, self._volume)
+            if peak > limit:
+                mixed = np.tanh(mixed / limit) * limit
 
             outdata[:] = mixed
 
-        except Exception:
+        except Exception as exc:
+            print(f"[Audio Callback Error] {exc}")
             outdata[:] = 0.0

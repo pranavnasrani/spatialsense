@@ -58,8 +58,18 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--camera", type=int, default=1, metavar="N",
-    help="Camera index: 0 = MacBook webcam, 1 = iPhone Continuity Camera (default: 1)",
+    "--camera", type=int, choices=[0, 1], default=0,
+    help="Camera index: 0 for built-in, 1 for Continuity Camera (default 0)",
+)
+
+parser.add_argument(
+    "--no-yolo", "--depth-only", action="store_true", dest="no_yolo",
+    help="Run in depth-only mode without YOLO object detection / beeps",
+)
+
+parser.add_argument(
+    "--volume", type=float, default=1.0,
+    help="Audio volume multiplier (e.g. 1.0 default, 2.0 for 2x volume)",
 )
 
 args = parser.parse_args()
@@ -110,8 +120,12 @@ CONF_THRESHOLD = 0.4
 
 # ── Model Loading ──────────────────────────────────────────────────────────────
 
-print(f"Loading {yolo_cfg['name']} MLX model...")
-yolo_model = YOLO(yolo_cfg["path"])
+yolo_model = None
+if not args.no_yolo:
+    print(f"Loading {yolo_cfg['name']} MLX model...")
+    yolo_model = YOLO(yolo_cfg["path"])
+else:
+    print("Running in Depth-Only mode (YOLO disabled).")
 
 print(f"Loading {depth_cfg['name']} CoreML model (ANE)...")
 depth_model = ct.models.MLModel(depth_cfg["path"])
@@ -128,14 +142,25 @@ print(f"Models loaded. Starting capture...")
 
 audio_engine: AudioEngine | None = None
 if not args.no_audio:
-    audio_engine = AudioEngine()
+    audio_engine = AudioEngine(volume=args.volume)
     audio_engine.start()
 
-WINDOW_TITLE = f"SpatialSense | {yolo_cfg['name']} (MLX) + {depth_cfg['name']} (ANE)"
+if args.no_yolo:
+    WINDOW_TITLE = f"SpatialSense | Depth-Only + {depth_cfg['name']} (ANE)"
+else:
+    WINDOW_TITLE = f"SpatialSense | {yolo_cfg['name']} (MLX) + {depth_cfg['name']} (ANE)"
 
 # ── Video Capture Setup ────────────────────────────────────────────────────────
 
 cap = cv2.VideoCapture(args.camera)
+
+print("Waiting for camera to initialize (5 seconds to let auto-exposure settle)...")
+start_time = time.time()
+while time.time() - start_time < 5.0:
+    ret, _ = cap.read()
+    if not ret:
+        time.sleep(0.1)
+
 frame_count = 0
 depth_colormap = None
 depth_map = None
@@ -160,11 +185,13 @@ try:
         frame_count += 1
         h, w, _ = frame.shape
 
-        # A. YOLO Detection (every frame) — MLX / Apple Metal GPU
-        t0 = time.perf_counter()
-        yolo_results = yolo_model.predict(frame, conf=CONF_THRESHOLD)
-        yolo_ms = (time.perf_counter() - t0) * 1000
-        yolo_ms_ema = EMA_ALPHA * yolo_ms + (1 - EMA_ALPHA) * yolo_ms_ema
+        # A. YOLO Detection (every frame if enabled) — MLX / Apple Metal GPU
+        yolo_results = []
+        if yolo_model is not None:
+            t0 = time.perf_counter()
+            yolo_results = yolo_model.predict(frame, conf=CONF_THRESHOLD)
+            yolo_ms = (time.perf_counter() - t0) * 1000
+            yolo_ms_ema = EMA_ALPHA * yolo_ms + (1 - EMA_ALPHA) * yolo_ms_ema
 
         # B. Depth Estimation (every DEPTH_FRAME_INTERVAL frames) — CoreML / ANE
         if depth_map is None or frame_count % DEPTH_FRAME_INTERVAL == 0:
@@ -218,10 +245,11 @@ try:
                     x_start, x_end = col * cell_w, (col + 1) * cell_w
 
                     cell_crop = depth_map[y_start:y_end, x_start:x_end]
-                    if cell_crop.size > 0:
-                        # Use 90th percentile (closest objects after normalization/inversion)
-                        # or median to represent sector distance
-                        grid_matrix[row, col] = float(np.percentile(cell_crop, 85))
+                    # Subsample to drastically speed up percentile computation
+                    sub_crop = cell_crop[::4, ::4]
+                    if sub_crop.size > 0:
+                        # Use 85th percentile (closest objects after normalization/inversion)
+                        grid_matrix[row, col] = float(np.percentile(sub_crop, 85))
 
         # D. Draw 3×3 Grid HUD & Overlays on Camera Feed
         if depth_map is not None:
@@ -328,9 +356,10 @@ try:
         fps_ema = EMA_ALPHA * fps + (1 - EMA_ALPHA) * fps_ema if fps_ema > 0 else fps
 
         # E. Draw performance metrics overlay (top-left of detection view)
+        yolo_status = "Disabled" if args.no_yolo else f"{yolo_ms_ema:.1f}ms ({yolo_cfg['name']})"
         metrics = [
             f"FPS: {fps_ema:.1f}",
-            f"YOLO: {yolo_ms_ema:.1f}ms ({yolo_cfg['name']})",
+            f"YOLO: {yolo_status}",
             f"Depth: {depth_ms_ema:.1f}ms ({depth_cfg['name']})",
             f"Frame: {frame_ms:.1f}ms",
         ]
