@@ -1,5 +1,7 @@
-ultralytics
+yolo-mlx
+coremltools
 huggingface-hub
-torch
-transformers
 opencv-python
+numpy
+Pillow
+sounddevice
