@@ -57,6 +57,11 @@ parser.add_argument(
     help="Disable binaural audio output (useful when debugging visuals)",
 )
 
+parser.add_argument(
+    "--camera", type=int, default=1, metavar="N",
+    help="Camera index: 0 = MacBook webcam, 1 = iPhone Continuity Camera (default: 1)",
+)
+
 args = parser.parse_args()
 
 # ── Model Configuration ───────────────────────────────────────────────────────
@@ -130,7 +135,7 @@ WINDOW_TITLE = f"SpatialSense | {yolo_cfg['name']} (MLX) + {depth_cfg['name']} (
 
 # ── Video Capture Setup ────────────────────────────────────────────────────────
 
-cap = cv2.VideoCapture(1)  #0 for MacBook Camera, 1 for iPhone Continuity Camera
+cap = cv2.VideoCapture(args.camera)
 frame_count = 0
 depth_colormap = None
 depth_map = None
